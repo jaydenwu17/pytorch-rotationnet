@@ -13,6 +13,7 @@ import argparse
 import os
 import shutil
 import time
+import csv
 
 import torch
 import torch.nn as nn
@@ -63,6 +64,7 @@ parser.add_argument('--dist-backend', default='gloo', type=str,
 parser.add_argument('--case', default='2', type=str,
                     help='viewpoint setup case (1 or 2)')
 parser.add_argument('--type', type=str, help='type of data being tested: test_real, test_synthetic, test')
+parser.add_argument('--csvpath', type=str, help='csv path for saving the chair score')
 
 best_prec1 = 0
 vcand = np.load('vcand_case2.npy')
@@ -121,6 +123,22 @@ class FineTuneModel(nn.Module):
             f = f.view(f.size(0), -1)
         y = self.classifier(f)
         return y
+
+
+# Child Class to retrieve the original file path
+class RotationNetDataset(datasets.folder.ImageFolder):
+    def __init__(self, root, transform=None, target_transform=None):
+	super(RotationNetDataset, self).__init__(root, transform=transform, target_transform=target_transform)
+
+    def __getitem__(self, index):
+	path, target = self.samples[index]
+      	sample = self.loader(path)
+	if self.transform is not None:
+	    sample = self.transform(sample)
+  	if self.target_transform is not None:
+	    target = self.target_transform(target)
+
+	return sample, target, path
 
 
 def main():
@@ -204,21 +222,29 @@ def main():
     else:
         train_sampler = None
 
+#    test_loader = torch.utils.data.DataLoader(
+#        datasets.ImageFolder(testdir, transforms.Compose([
+##            transforms.Scale(256),
+##            transforms.CenterCrop(224),
+#            transforms.ToTensor(),
+#            normalize,
+#        ])),
+#        batch_size=args.batch_size, shuffle=False,
+#        num_workers=args.workers, pin_memory=True)
     test_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(testdir, transforms.Compose([
-#            transforms.Scale(256),
-#            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+	 RotationNetDataset(testdir, transform=transforms.Compose([
+	     transforms.ToTensor(),
+             normalize,
+	 ])),
+	 batch_size=args.batch_size, shuffle=False,
+	 num_workers=args.workers, pin_memory=True)
+
     test_loader.dataset.imgs = sorted(test_loader.dataset.imgs)
 
-    validate(test_loader, model, criterion)
+    validate(test_loader, model, criterion, args.csvpath)
 
 
-def validate(test_loader, model, criterion):
+def validate(test_loader, model, criterion, csv_path):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -226,6 +252,9 @@ def validate(test_loader, model, criterion):
 
     # switch to evaluate mode
     model.eval()
+
+    # writerow to save the score of the chair for PR curve
+    writerow = {} 
 
     end = time.time()
 
@@ -235,13 +264,14 @@ def validate(test_loader, model, criterion):
     classification_chair_correct = 0
     classification_nonchair_correct = 0
 
-    for i, (input, target) in enumerate(test_loader):
-
-	# Debug
-#	print("########## Debug ############")
+    for i, (input, target, path) in enumerate(test_loader):
 	
+	# Debug
+	print("########## Debug ############")
+	model_name = path[0].split('/')[-1].split('.')[0][:-4]
+	print model_name
 #	print('Target: {}'.format(target))
-#	print("Test Input: {}".format(input))
+#	print("Test Loader: {}".format(test_loader[i]))
 
         target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input, volatile=True)
@@ -250,19 +280,26 @@ def validate(test_loader, model, criterion):
         # compute output
         output = model(input_var)
         loss = criterion(output, target_var)
-
+	
+#	print 'Raw Output Shape: ', output.shape
+	
         # log_softmax and reshape output
         num_classes = int( output.size( 1 ) / nview ) - 1
         output = output.view( -1, num_classes + 1 )
         output = torch.nn.functional.log_softmax( output )
         output = output[ :, :-1 ] - torch.t( output[ :, -1 ].repeat( 1, output.size(1)-1 ).view( output.size(1)-1, -1 ) )
         output = output.view( -1, nview * nview, num_classes )
-	
+		
+#	print 'Softmax Output: ', output	
+#	print 'Softmax Output Shape: ', output.shape
         # measure accuracy and record loss
-        res, classification_result, classification_gt_is_chair = my_accuracy(output.data, target, topk=(1, 5))
+        res, classification_result, classification_gt_is_chair, model_chair_score = my_accuracy(output.data, target, model_name, topk=(1, 5))
         prec1, prec5 = res
 	
-        if classification_gt_is_chair == 1:
+	# writerow update new model	
+	writerow[model_name] = model_chair_score.cpu().data.numpy().astype(np.float64).item()
+
+        if classification_gt_is_chair == 1: 
 	    gt_is_chair_num += 1
             classification_chair_correct += classification_result
         elif classification_gt_is_chair == 0:
@@ -299,8 +336,18 @@ def validate(test_loader, model, criterion):
     print("Classification Chair Correct: {}".format(classification_chair_correct))
     print("Groundtruch Chair Num: {}".format(gt_is_chair_num))
     classification_chair_accuracy = classification_chair_correct / gt_is_chair_num
-    print "Chair classification acc.: %.2f" % (classification_chair_correct / gt_is_chair_num)
-    print "Overall classifocatopm acc.: %.2f" % (chair_classification_overall_accuracy)    
+    print "Chair classification acc.: %.5f" % (classification_chair_correct / gt_is_chair_num)
+    print "Overall classifocatopm acc.: %.5f" % (chair_classification_overall_accuracy)    
+
+    # Write CSV
+    with open(csv_path, 'w') as csv_file:
+	writer = csv.writer(csv_file)
+	for model_name in writerow.keys():
+	    row = []
+	    row.append(model_name)
+	    row.append(writerow[model_name])
+	    writer.writerow(row)
+#    print("Chair Score: ", writerow)
 
     return top1.avg
 
@@ -339,7 +386,7 @@ def accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
-def my_accuracy(output_, target, topk=(1,)):
+def my_accuracy(output_, target, model_name, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
     maxk = max(topk)
     target = target[0:-1:nview]
@@ -354,20 +401,30 @@ def my_accuracy(output_, target, topk=(1,)):
     for j in range(vcand.shape[0]):
         for k in range(vcand.shape[1]):
             scores[ j ] = scores[ j ] + output_[ vcand[ j ][ k ] * nview + k ]
+	
+    ##### Debug #####
+#    print 'Scores: ', scores
+#    print 'Scores shape: ', scores.shape
+    #################
+
     # for each sample #n, determine the best pose that maximizes the score (for the top class)
     for n in range( batch_size ):
         j_max = int( np.argmax( scores[ :, :, n ] ) / scores.shape[ 1 ] )
         output[ n ] = torch.FloatTensor( scores[ j_max, :, n ] )
     output = output.cuda()
 
+#    print 'output: ', output
+    chair_score = output[0][8]
+    print 'chair score: ', chair_score
+
     _, pred = output.topk(maxk, 1, True, True)
     pred = pred.t()
     
-#    print 'prediction: ', pred
+    print 'prediction: ', pred
     target_class = target.cpu().data.numpy()[0]
-#    print("Target Class: {}".format(target_class))
+    print("Target Class: {}".format(target_class))
     prediction_class = pred.cpu().data.numpy()[0][0]
-#    print ("Prediction Class: {}".format(prediction_class))
+    print ("Prediction Class: {}".format(prediction_class))
     
     # Classification results true/false
     classification_correct = 0
@@ -375,22 +432,22 @@ def my_accuracy(output_, target, topk=(1,)):
     classification_gt_is_chair = 0
     
     # Example is a chair
-    if target_class == 8:
+    if target_class == 8 and model_name != 'chair_0944' and model_name != 'chair_0950':
 	classification_gt_is_chair = 1
 	if prediction_class == 8:
             classification_correct = 1
     # Example is a non-chair
-    elif target_class != 8:
+    elif target_class != 8 or model_name == 'chair_0944' or model_name == 'chair_0950':
         if prediction_class != 8:
-            classification_correct += 1		
-
-    correct = pred.eq(target.contiguous().view(1, -1).expand_as(pred))
+            classification_correct = 1		
     
+    correct = pred.eq(target.contiguous().view(1, -1).expand_as(pred))
+
     res = []
     for k in topk:
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
-    return res, classification_correct, classification_gt_is_chair
+    return res, classification_correct, classification_gt_is_chair, chair_score
 
 
 if __name__ == '__main__':
